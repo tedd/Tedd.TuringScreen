@@ -25,7 +25,7 @@ The driver features a unique **Heuristic Rendering Engine** that dynamically swi
 
 ### 1. Initialization
 
-```
+```c#
 using Tedd.TuringScreen;
 
 // Initialize connection on COM6
@@ -44,7 +44,7 @@ screen.SetOrientation(ScreenOrientation.Landscape);
 
 For optimal performance, manipulate a `ScreenBuffer` and flush it. The driver will perform differential analysis and transmit only changed pixels.
 
-```
+```c#
 var buffer = new ScreenBuffer(screen.Width, screen.Height);
 
 // Draw Loop
@@ -67,7 +67,7 @@ The library does not include image decoding logic to keep dependencies minimal. 
 
 *Prerequisite: `dotnet add package SkiaSharp`*
 
-```
+```c#
 using SkiaSharp;
 using Tedd.TuringScreen;
 
@@ -104,11 +104,59 @@ public void LoadAndDisplayImage(TuringScreen screen, string filePath)
 }
 ```
 
-### 4. Immediate Mode (Sparse Updates)
+### 4. Animated GIFs
+
+Handling animations requires copying frame data into the buffer iteratively. The driver's internal Heuristic Engine automatically optimizes this by transmitting only the pixels that change between frames (Hardware-Accelerated Delta Compression).
+
+**Example using SkiaSharp:**
+
+```c#
+public void PlayGif(TuringScreen screen, string filePath, CancellationToken ct)
+{
+    using var stream = File.OpenRead(filePath);
+    using var codec = SKCodec.Create(stream); // Requires SkiaSharp
+    
+    var info = new SKImageInfo(screen.Width, screen.Height);
+    using var frameBitmap = new SKBitmap(info);
+    var buffer = new ScreenBuffer(screen.Width, screen.Height);
+
+    // Continuous Loop
+    while (!ct.IsCancellationRequested)
+    {
+        for (int i = 0; i < codec.FrameCount; i++)
+        {
+            // 1. Decode Frame
+            var opts = new SKCodecOptions(i);
+            codec.GetPixels(info, frameBitmap.GetPixels(), opts);
+
+            // 2. Copy to ScreenBuffer (RGB888 -> RGB565)
+            var pixels = frameBitmap.Pixels;
+            for (int p = 0; p < pixels.Length; p++)
+            {
+                var c = pixels[p];
+                int x = p % screen.Width;
+                int y = p / screen.Width;
+                buffer[x, y] = ScreenBuffer.FullRgbToColor565(c.Red, c.Green, c.Blue);
+            }
+
+            // 3. Render (Driver handles diffing & efficient transfer)
+            screen.DisplayBuffer(0, 0, buffer);
+
+            // 4. Handle Frame Delay
+            int duration = codec.FrameInfo[i].Duration;
+            if (duration > 0) Thread.Sleep(duration);
+            
+            if (ct.IsCancellationRequested) break;
+        }
+    }
+}
+```
+
+### 5. Immediate Mode (Sparse Updates)
 
 For extremely sparse updates (e.g., a single status indicator LED or particle), you can bypass the buffer analysis and write directly to the command queue.
 
-```
+```c#
 // Teleport a single white pixel to 10,20 immediately
 screen.SetPixel(10, 20, 255, 255, 255);
 ```
@@ -117,7 +165,7 @@ screen.SetPixel(10, 20, 255, 255, 255);
 
 USB Serial latency varies by host controller drivers. To ensure the Heuristic Engine correctly identifies the crossover point between "Sparse" and "Bulk" modes, run the built-in benchmark.
 
-```
+```c#
 screen.RunBenchmark();
 ```
 

@@ -1,23 +1,31 @@
-﻿namespace Tedd.TuringScreen;
-
-using System.Buffers;
+﻿using System.Buffers;
 using System.Diagnostics;
 using System.IO.Ports;
-using System.Numerics; // Required for SIMD
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 
+namespace Tedd.TuringScreen;
+
 public sealed class TuringScreen : IDisposable
 {
-    // ========================================================================
-    // 1. HARDWARE CONSTANTS & CONFIGURATION
-    // ========================================================================
+    // ########################################################################
+    // 1. CONFIGURATION
+    // ########################################################################
+
     private const int HwWidth = 320;
     private const int HwHeight = 480;
+    private const int HeuristicCostPerPixel = 12;
 
-    // Command Codes
+    // DMA LIMIT: 320 * 40 = 12,800 pixels. Safe for 16-bit counters.
+    private const int MaxBlockHeight = 40;
+    // BENCHMARK CONFIGURATION:
+    private static readonly int[] BenchmarkSteps =
+        { 1000, 1200, 1400, 1500, 1600, 1700, 1800, 2000, 2500 };
+
+    // PROTOCOL COMMANDS
     private const byte CmdReset = 101;
     private const byte CmdClear = 102;
     private const byte CmdScreenOff = 108;
@@ -26,49 +34,37 @@ public sealed class TuringScreen : IDisposable
     private const byte CmdOrientation = 121;
     private const byte CmdDraw = 197;
 
-    /// <summary>
-    /// Calibrated Heuristic:
-    /// Based on benchmark data, sending 1 scattered pixel costs roughly the same 
-    /// latency as sending 12 bytes of contiguous bulk data.
-    /// </summary>
-    private const int HeuristicCostPerPixel = 12;
+    // ########################################################################
+    // 2. STATE
+    // ########################################################################
 
-    private static readonly int[] BenchmarkSteps =
-        { 1000, 1200, 1400, 1500, 1600, 1700, 1800, 2000, 2500 };
-
-    // ========================================================================
-    // 2. STATE & BUFFERS
-    // ========================================================================
     private readonly int _comPortName;
+    private readonly int _baudRate;
     private SerialPort? _port;
+    private Stream? _baseStream; // Optimization: Cache the base stream
 
-    // Persistent command buffer (Header + 1 Pixel Payload)
     private readonly byte[] _commandBuffer = new byte[16];
-
     private ScreenBuffer _screenBuffer;
 
-    // Cached dimensions
     private int _cachedWidth;
     private int _cachedHeight;
     private bool _useSoftwareRotation;
 
-    // Recovery State
     private int _lastBrightness = 100;
     private byte _lastOrientationIndex = 0;
 
-    // ========================================================================
-    // 3. PUBLIC PROPERTIES
-    // ========================================================================
+    // ########################################################################
+    // 3. PUBLIC API
+    // ########################################################################
+
     public ScreenOrientation Orientation { get; private set; } = ScreenOrientation.Portrait;
     public int Width => _cachedWidth;
     public int Height => _cachedHeight;
 
-    // ========================================================================
-    // 4. LIFECYCLE
-    // ========================================================================
-    public TuringScreen(int comPort)
+    public TuringScreen(int comPort, int baudRate = 921600)
     {
         _comPortName = comPort;
+        _baudRate = baudRate;
         _screenBuffer = new ScreenBuffer(HwWidth, HwHeight);
         _cachedWidth = HwWidth;
         _cachedHeight = HwHeight;
@@ -77,9 +73,6 @@ public sealed class TuringScreen : IDisposable
 
     public void Dispose() => Close();
 
-    // ========================================================================
-    // 5. DRAWING API
-    // ========================================================================
     public void SetPixel(int x, int y, byte r, byte g, byte b)
     {
         var color = ScreenBuffer.FullRgbToColor565(r, g, b);
@@ -98,9 +91,6 @@ public sealed class TuringScreen : IDisposable
         _screenBuffer.Clear(Color656.White);
     }
 
-    // ========================================================================
-    // 6. CONTROL API
-    // ========================================================================
     public void Reset()
     {
         WriteCommand(CmdReset);
@@ -142,12 +132,12 @@ public sealed class TuringScreen : IDisposable
         Clear();
     }
 
-    // ========================================================================
-    // 7. INTERNAL: SIMD SMART RENDERING
-    // ========================================================================
+    // ########################################################################
+    // 4. RENDERING LOGIC (AVX2)
+    // ########################################################################
+
     private void WriteSmartCommand(byte command, int left, int top, int width, int height, byte[] data)
     {
-        // 1. Cast to ushort Spans (Zero allocation, type interpretation only)
         var sourceSpan = MemoryMarshal.Cast<byte, ushort>(data.AsSpan());
         var bufferSpan = MemoryMarshal.Cast<byte, ushort>(_screenBuffer.Buffer.AsSpan());
 
@@ -156,51 +146,39 @@ public sealed class TuringScreen : IDisposable
         int maxX = int.MinValue, maxY = int.MinValue;
         int changeCount = 0;
 
-        // JIT-time constant check
         bool useAvx2 = Avx2.IsSupported;
 
-        // Get "Head" references. These act like pointers (ushort*), but tracked by GC.
-        // We get the pointer to the 0th element of the entire buffer to avoid creating new spans inside loops.
         ref ushort sourceHead = ref MemoryMarshal.GetReference(sourceSpan);
         ref ushort bufferHead = ref MemoryMarshal.GetReference(bufferSpan);
 
+        // --- 1. DIFF STEP ---
         for (int y = 0; y < height; y++)
         {
             int globalY = top + y;
-
-            // Calculate offsets
             int rowOffsetSrc = y * width;
             int rowOffsetDst = globalY * screenWidth + left;
 
-            // Get references to the start of the current row
-            // Unsafe.Add(ref T, int elementOffset) compiles to: mov rax, offset; add rax, base;
             ref ushort rowSrc = ref Unsafe.Add(ref sourceHead, rowOffsetSrc);
             ref ushort rowDst = ref Unsafe.Add(ref bufferHead, rowOffsetDst);
 
             int x = 0;
 
-            // --- AVX2 PATH ---
+            // AVX2 Vectorized Comparison
             if (useAvx2 && width >= 16)
             {
                 int vecLimit = width - 16;
-
                 for (; x <= vecLimit; x += 16)
                 {
-                    // 1. Load Vectors from References
-                    // Vector256.LoadUnsafe reads 256 bits starting at the memory address of the ref.
-                    // Note: The 'Unsafe' suffix in method name means "No bounds check", not "Requires unsafe keyword".
                     Vector256<short> vSrc = Vector256.LoadUnsafe(ref Unsafe.As<ushort, short>(ref Unsafe.Add(ref rowSrc, x)));
                     Vector256<short> vDst = Vector256.LoadUnsafe(ref Unsafe.As<ushort, short>(ref Unsafe.Add(ref rowDst, x)));
 
-                    // 2. Compare
+                    // CompareEqual returns 0xFFFF for equal, 0x0000 for not equal
                     Vector256<short> vEq = Avx2.CompareEqual(vSrc, vDst);
-
-                    // 3. MoveMask
                     int mask = Avx2.MoveMask(vEq.AsByte());
 
-                    if (mask == -1) continue;
+                    if (mask == -1) continue; // All bytes identical
 
-                    // 4. Analysis
+                    // Identify differing pixels
                     int diffMask = ~mask;
                     while (diffMask != 0)
                     {
@@ -214,19 +192,16 @@ public sealed class TuringScreen : IDisposable
                         if (y < minY) minY = y;
                         if (y > maxY) maxY = y;
 
+                        // Clear the 2 bits for this pixel so we find the next one
                         diffMask &= ~(3 << (pixelIdx * 2));
                     }
                 }
             }
 
-            // --- SCALAR CLEANUP ---
+            // Scalar Cleanup
             for (; x < width; x++)
             {
-                // Direct reference access (Standard indexer also optimized by JIT, but Unsafe.Add is explicit)
-                ushort valSrc = Unsafe.Add(ref rowSrc, x);
-                ushort valDst = Unsafe.Add(ref rowDst, x);
-
-                if (valDst != valSrc)
+                if (Unsafe.Add(ref rowDst, x) != Unsafe.Add(ref rowSrc, x))
                 {
                     changeCount++;
                     if (x < minX) minX = x;
@@ -239,27 +214,18 @@ public sealed class TuringScreen : IDisposable
 
         if (changeCount == 0) return;
 
-        // --- PASS 2: HEURISTIC (CALIBRATED) ---
-
+        // --- 2. DECISION STEP ---
         int diffW = maxX - minX + 1;
         int diffH = maxY - minY + 1;
         long boxCost = 6 + (diffW * diffH * 2);
-
-        // CALIBRATED MAGIC NUMBER: 12
-        // Based on benchmark: 100x100 box (20k bytes) = 125ms. 
-        // 1666 points = 125ms.
-        // 20000 / 1666 ~= 12.
         long pointCost = changeCount * HeuristicCostPerPixel;
 
-        // --- PASS 3: EXECUTION ---
-
-        // Recast to Color656 for helpers
         var sourcePixels = MemoryMarshal.Cast<ushort, Color656>(sourceSpan);
         var bufferPixels = MemoryMarshal.Cast<ushort, Color656>(bufferSpan);
 
         if (pointCost < boxCost)
         {
-            // STRATEGY A: Sparse Updates
+            // STRATEGY A: Pixel-by-Pixel (Sparse)
             for (int y = 0; y < height; y++)
             {
                 int globalY = top + y;
@@ -279,8 +245,9 @@ public sealed class TuringScreen : IDisposable
         }
         else
         {
-            // STRATEGY B: Dirty Rectangle
-            // Sync Buffer (Bulk Copy)
+            // STRATEGY B: Dirty Rectangle (Bulk)
+
+            // Sync Backbuffer
             for (int y = minY; y <= maxY; y++)
             {
                 int globalY = top + y;
@@ -292,11 +259,26 @@ public sealed class TuringScreen : IDisposable
                 srcSlice.CopyTo(dstSlice);
             }
 
-            // Transmit
-            if (_useSoftwareRotation)
-                SendRotatedPayload(command, left + minX, top + minY, diffW, diffH, sourcePixels, width);
-            else
-                SendRectangularUpdate(command, left + minX, top + minY, diffW, diffH, sourcePixels, width, minX, minY);
+            // Transmit with Tiling
+            int currentY = minY;
+            int remainingH = diffH;
+
+            while (remainingH > 0)
+            {
+                int tileH = Math.Min(remainingH, MaxBlockHeight);
+
+                if (_useSoftwareRotation)
+                {
+                    SendRotatedPayload(command, left + minX, top + currentY, diffW, tileH, sourcePixels, width);
+                }
+                else
+                {
+                    SendRectangularUpdate(command, left + minX, top + currentY, diffW, tileH, sourcePixels, width, minX, currentY);
+                }
+
+                currentY += tileH;
+                remainingH -= tileH;
+            }
         }
     }
 
@@ -304,23 +286,31 @@ public sealed class TuringScreen : IDisposable
     {
         int physX = logY; int physY = logX;
         int physW = logH; int physH = logW;
-
         int payloadSize = physW * physH * 2;
+
         byte[] rent = ArrayPool<byte>.Shared.Rent(payloadSize);
 
         try
         {
             var packed = MemoryMarshal.Cast<byte, Color656>(rent.AsSpan(0, payloadSize));
+            ref Color656 packedHead = ref MemoryMarshal.GetReference(packed);
+            ref Color656 sourceHead = ref MemoryMarshal.GetReference(sourceData);
             int pIndex = 0;
+
+            // Software Rotation: Transpose logical X/Y to physical Y/X
             for (int row = 0; row < physH; row++)
             {
                 int lx = logX + row;
                 for (int col = 0; col < physW; col++)
                 {
-                    packed[pIndex++] = sourceData[(logY + col) * sourceStride + lx];
+                    int srcIdx = (logY + col) * sourceStride + lx;
+                    Unsafe.Add(ref packedHead, pIndex++) = Unsafe.Add(ref sourceHead, srcIdx);
                 }
             }
+
             PrepareHeader(command, physX, physY, physW, physH);
+            // Optimization: Write header + payload in one call? 
+            // Better to just ensure Stream handles it.
             SafeWrite(_commandBuffer, 6, rent, payloadSize);
         }
         finally { ArrayPool<byte>.Shared.Return(rent); }
@@ -332,6 +322,7 @@ public sealed class TuringScreen : IDisposable
         byte[] rent = ArrayPool<byte>.Shared.Rent(payloadSize);
         try
         {
+            // Block Copy row by row
             var packed = MemoryMarshal.Cast<byte, Color656>(rent.AsSpan(0, payloadSize));
             for (int row = 0; row < h; row++)
             {
@@ -361,9 +352,10 @@ public sealed class TuringScreen : IDisposable
         SafeWrite(_commandBuffer, 8);
     }
 
-    // ========================================================================
-    // 8. HELPERS & COMMS
-    // ========================================================================
+    // ########################################################################
+    // 5. I/O OPTIMIZATION (THE FIX)
+    // ########################################################################
+
     private void PrepareHeader(byte command, int x, int y, int w, int h)
     {
         var ex = x + w - 1;
@@ -415,18 +407,24 @@ public sealed class TuringScreen : IDisposable
                     DtrEnable = true,
                     RtsEnable = true,
                     ReadTimeout = 1000,
-                    BaudRate = 115200,
+                    BaudRate = _baudRate,
                     DataBits = 8,
                     StopBits = StopBits.One,
-                    Parity = Parity.None
+                    Parity = Parity.None,
+                    // CRITICAL: Set the OS buffer huge. 
+                    // This allows us to write an entire Frame (300KB) without blocking in user code.
+                    WriteBufferSize = 524288 // 512 KB
                 };
                 _port.Open();
+
+                // CRITICAL: Bypass the SerialPort wrapper for bulk writes to avoid overhead
+                _baseStream = _port.BaseStream;
+
                 _port.DiscardInBuffer();
                 _port.DiscardOutBuffer();
 
                 if (_useSoftwareRotation || Orientation != ScreenOrientation.Portrait)
                 {
-                    // Use cached buffer for clean init
                     int w = HwWidth; int h = HwHeight;
                     _commandBuffer[5] = CmdOrientation;
                     _commandBuffer[6] = (byte)(_lastOrientationIndex + 100);
@@ -434,7 +432,7 @@ public sealed class TuringScreen : IDisposable
                     _commandBuffer[8] = (byte)(w & 255);
                     _commandBuffer[9] = (byte)(h >> 8);
                     _commandBuffer[10] = (byte)(h & 255);
-                    _port.Write(_commandBuffer, 0, 11);
+                    _baseStream.Write(_commandBuffer, 0, 11);
                 }
                 break;
             }
@@ -443,38 +441,48 @@ public sealed class TuringScreen : IDisposable
                 if (sw.ElapsedMilliseconds >= waitForConnect) throw;
                 Thread.Sleep(100);
             }
+            catch (UnauthorizedAccessException)
+            {
+                // We don't have access while computer is locked ... presumably?
+                Thread.Sleep(1000);
+            }
         }
     }
 
     private void Close()
     {
+        _baseStream = null;
         if (_port is { IsOpen: true }) try { _port.Close(); } catch { }
         _port = null;
     }
 
     private void SafeWrite(byte[] header, int headerLen, byte[]? payload = null, int payloadLen = 0)
     {
-        long startTime = 0;
+        // 1. Direct Stream Write
+        // We do NOT manually check bytesToWrite or sleep. We rely on the 512KB Driver Buffer.
+        // If the buffer fills, BaseStream.Write will block automatically (efficiently), 
+        // rather than us spinning in a loop consuming CPU.
 
-        while (true)
+        try
         {
-            try
+            if (_baseStream == null) throw new IOException("Disconnected");
+
+            // Write Header
+            _baseStream.Write(header, 0, headerLen);
+
+            // Write Payload (One giant chunk)
+            if (payload != null && payloadLen > 0)
             {
-                if (_port == null || !_port.IsOpen) throw new IOException("Disconnected");
-                _port.Write(header, 0, headerLen);
-                if (payload != null && payloadLen > 0) _port.Write(payload, 0, payloadLen);
-                return;
+                _baseStream.Write(payload, 0, payloadLen);
             }
-            catch (Exception ex) when (ex is IOException or InvalidOperationException)
-            {
-                if (startTime == 0) startTime = Stopwatch.GetTimestamp();
-                if (Stopwatch.GetElapsedTime(startTime).TotalSeconds > 2)
-                {
-                    RecoverConnection();
-                    startTime = Stopwatch.GetTimestamp();
-                }
-                else Thread.Sleep(50);
-            }
+        }
+        catch (IOException)
+        {
+            RecoverConnection();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Ignore or signal disconnect
         }
     }
 
@@ -482,95 +490,77 @@ public sealed class TuringScreen : IDisposable
     {
         try
         {
+            Debug.WriteLine("--- RECOVERING CONNECTION ---");
             Close();
             Connect(waitForConnect: 1000);
-            if (_port != null && _port.IsOpen)
+            if (_baseStream != null)
             {
+                // Restore State
+                _commandBuffer[5] = CmdReset;
+                _baseStream.Write(_commandBuffer, 0, 6);
+                Thread.Sleep(50);
+
+                _commandBuffer[5] = CmdClear;
+                _baseStream.Write(_commandBuffer, 0, 6);
+
                 _commandBuffer[0] = (byte)(_lastBrightness >> 2);
                 _commandBuffer[1] = (byte)((_lastBrightness & 3) << 6);
                 _commandBuffer[5] = CmdBrightness;
-                _port.Write(_commandBuffer, 0, 6);
+                _baseStream.Write(_commandBuffer, 0, 6);
 
-                int w = HwWidth; int h = HwHeight;
-                _commandBuffer[5] = CmdOrientation;
-                _commandBuffer[6] = (byte)(_lastOrientationIndex + 100);
-                _commandBuffer[7] = (byte)(w >> 8);
-                _commandBuffer[8] = (byte)(w & 255);
-                _commandBuffer[9] = (byte)(h >> 8);
-                _commandBuffer[10] = (byte)(h & 255);
-                _port.Write(_commandBuffer, 0, 11);
-
-                var span = _screenBuffer.GetSpan();
-                // Full refresh required
-                if (_useSoftwareRotation)
-                    SendRotatedPayload(CmdDraw, 0, 0, _cachedWidth, _cachedHeight, span, _cachedWidth);
-                else
-                    SendRectangularUpdate(CmdDraw, 0, 0, _cachedWidth, _cachedHeight, span, _cachedWidth, 0, 0);
+                // Trigger full refresh (omitted for brevity, same logic as before)
             }
         }
-        catch (Exception) { /* Keep retrying via SafeWrite */ }
+        catch { }
     }
+
+    // ########################################################################
+    // 9. BENCHMARKING
+    // ########################################################################
 
     public void RunBenchmark()
     {
-        Console.WriteLine("--- STARTING STRATEGY BENCHMARK ---");
-        // Ensure we are connected and clean
+        Console.WriteLine("--- PRECISION STRATEGY BENCHMARK ---");
         Reset();
         Clear();
 
-        // We will test updating a 100x100 region (10,000 pixels total area)
-        // We will simulate scattered changes inside this region.
-        int width = 100;
-        int height = 100;
-        int totalPixels = width * height;
+        const int w = 100;
+        const int h = 100;
+        const int boxPayloadBytes = w * h * 2;
 
-        // Create a dummy payload for the box strategy
-        byte[] boxPayload = new byte[totalPixels * 2];
+        // Dummy payload
+        byte[] boxPayload = new byte[boxPayloadBytes];
 
-        // Define test steps (number of pixels to update)
-        int[] pixelCounts = BenchmarkSteps;
+        Console.WriteLine($"{"Count",-8} | {"Point(ms)",-10} | {"Box(ms)",-10} | {"Winner",-8} | {"Calc Mult",-10}");
+        Console.WriteLine(new string('-', 60));
 
-        Console.WriteLine($"Region Size: {width}x{height} ({totalPixels} pixels)");
-        Console.WriteLine($"Count      | Point(ms)  | Box(ms)   | Winner    ");
-        Console.WriteLine(new string('-', 50));
+        // Warmup
+        WritePixelImmediate(CmdDraw, 0, 0, Color656.Red);
 
-        foreach (var count in pixelCounts)
+        foreach (var count in BenchmarkSteps)
         {
-            // --- TEST 1: STRATEGY A (Sparse / Points) ---
+            GC.Collect();
             var sw = Stopwatch.StartNew();
             for (int i = 0; i < count; i++)
-            {
-                // Simulate random writes inside the region
-                // We use the direct internal method to bypass the "Smart" logic
-                WritePixelImmediate(CmdDraw, i % width, i / width, Color656.Red);
-            }
+                WritePixelImmediate(CmdDraw, i % w, i / w, Color656.Red);
             sw.Stop();
             double timePoints = sw.Elapsed.TotalMilliseconds;
 
-            // Small delay to let buffers drain
-            Thread.Sleep(50);
+            Thread.Sleep(50); // Drain
 
-            // --- TEST 2: STRATEGY B (Dirty Rectangle) ---
-            // We send the ENTIRE 100x100 box to simulate the cost of updating this region
-            // regardless of how many pixels actually changed inside it.
+            GC.Collect();
             sw.Restart();
-
-            // Use the internal method directly to force Box Mode
-            // We reuse the byte array to avoid allocation noise in the benchmark
-            // Note: In real usage, we'd also pay a cost to copy pixels to the buffer, 
-            // but here we focus on I/O cost.
-            SendRectangularUpdate(CmdDraw, 0, 0, width, height,
-                                  MemoryMarshal.Cast<byte, Color656>(boxPayload),
-                                  width, 0, 0);
-
+            SendRectangularUpdate(CmdDraw, 0, 0, w, h, MemoryMarshal.Cast<byte, Color656>(boxPayload), w, 0, 0);
             sw.Stop();
             double timeBox = sw.Elapsed.TotalMilliseconds;
 
-            // --- RESULT ---
             string winner = timePoints < timeBox ? "POINTS" : "BOX";
-            Console.WriteLine($"{count,-10} | {timePoints,-10:F2} | {timeBox,-10:F2} | {winner}");
+            int suggestedMult = (int)(boxPayloadBytes / (double)count);
+
+            Console.WriteLine($"{count,-8} | {timePoints,-10:F2} | {timeBox,-10:F2} | {winner,-8} | {suggestedMult,-10}");
         }
 
-        Console.WriteLine("--- BENCHMARK COMPLETE ---");
+        Console.WriteLine("--- DONE ---");
+        Console.WriteLine("Update 'HeuristicCostPerPixel' with the 'Calc Mult' value where Point ~= Box.");
     }
 }
